@@ -43,12 +43,14 @@ void set_params_fprop(Flash_fwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
-                      bool seqlenq_ngroups_swapped=false) {
+                      bool seqlenq_ngroups_swapped=false,
+                      bool use_fp8_kv_cache=false) {
 
     // Reset the parameters
     params = {};
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
+    params.use_fp8_kv_cache = use_fp8_kv_cache;
 
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
@@ -141,6 +143,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+                TORCH_CHECK(!params.use_fp8_kv_cache, "fp8 kv cache not supported for non-split");
                 run_mha_fwd_<elem_type, kHeadDim>(params, stream);
             } else {
                 run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
@@ -454,8 +457,15 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (q_dtype == torch::kBFloat16) {
         TORCH_CHECK(is_sm90 || is_sm8x, "bfloat16 is only supported on Ampere GPUs or newer");
     }
-    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    bool use_fp8_kv_cache = false;
+    if (k.dtype() == torch::kUInt8) {
+        use_fp8_kv_cache = true;
+        TORCH_CHECK(k.dtype() == v.dtype(), "key and value must have the same dtype");
+    }
+    else {
+        TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+        TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    }
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
 
@@ -606,7 +616,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     seqlenq_ngroups_swapped);
+                     seqlenq_ngroups_swapped,
+                     use_fp8_kv_cache);
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
@@ -703,8 +714,15 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (q_dtype == torch::kBFloat16) {
         TORCH_CHECK(is_sm90 || is_sm8x, "bfloat16 is only supported on Ampere GPUs or newer");
     }
-    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    bool use_fp8_kv_cache = false;
+    if (kcache.dtype() == torch::kUInt8) {
+        use_fp8_kv_cache = true;
+        TORCH_CHECK(kcache.dtype() == vcache.dtype(), "key and value must have the same dtype");
+    }
+    else {
+        TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+        TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    }
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
 
@@ -820,7 +838,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      /*p_dropout=*/0.f,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     /*seqlenq_ngroups_swapped=*/false,
+                     use_fp8_kv_cache);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
@@ -867,6 +887,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     params.is_seqlens_k_cumulative = !(seqlens_k_.has_value());
 
     if (rotary_cos_.has_value()) {
+        TORCH_CHECK(!use_fp8_kv_cache, "Fp8 kv cache not supported with rotary cos/sin");
         TORCH_CHECK(k_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
         auto rotary_cos = rotary_cos_.value();
         CHECK_DEVICE(rotary_cos);

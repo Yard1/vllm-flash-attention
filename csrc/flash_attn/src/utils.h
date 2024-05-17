@@ -352,6 +352,10 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
     // There's no case where !Clear_OOB_K && Clear_OOB_MN
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
+    using From_type = typename Engine0::value_type;
+    using To_type = typename Engine1::value_type;
+    static_assert(std::is_same_v<From_type, To_type>);
+    //constexpr bool uses_different_dtype = !std::is_same_v<From_type, To_type>;
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
         if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
@@ -406,6 +410,46 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     // }
 }
 
+
+
+template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
+          typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
+          typename Engine2, typename Layout2, typename Engine3, typename Layout3>
+__forceinline__ __device__ void copy_dtype(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
+                            Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
+                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+    CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
+    CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
+    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
+    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
+    // There's no case where !Clear_OOB_K && Clear_OOB_MN
+    static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
+    using From_type = typename Engine0::value_type;
+    using To_type = typename Engine1::value_type;
+    static_assert(!std::is_same_v<From_type, To_type>);
+    //constexpr bool uses_different_dtype = !std::is_same_v<From_type, To_type>;
+    #pragma unroll
+    for (int m = 0; m < size<1>(S); ++m) {
+        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+            #pragma unroll
+            for (int k = 0; k < size<2>(S); ++k) {
+                if (Is_even_K || predicate_K(k)) {
+                    Tensor S_reg = make_fragment_like(S(_, m, k));
+                    cute::copy_aligned( S(_, m, k), S_reg);
+                    Tensor D_reg = flash::convert_type<To_type>(S_reg);
+                    cute::copy_aligned(D_reg, D(_, m, k));
+                } else if (Clear_OOB_K) {
+                    cute::clear(D(_, m, k));
+                }
+            }
+        } else if (Clear_OOB_MN) {
+            cute::clear(D(_, m, _));
+        }
+    }
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <bool Is_even_K=true,
@@ -420,6 +464,9 @@ __forceinline__ __device__ void copy_w_min_idx(Tensor<Engine0, Layout0> const &S
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
     CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
+    using From_type = typename Engine0::value_type;
+    using To_type = typename Engine1::value_type;
+    static_assert(std::is_same_v<From_type, To_type>);
     // if (threadIdx.x == 0 && blockIdx.z == 0) { printf("blockIdx.y = %d, max_MN = %d, min_MN = %d\n", blockIdx.y, max_MN, min_MN); }
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
