@@ -471,14 +471,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, bool Use_fp8_kv_cache, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
-    using ElementKVCacheFp8 = typename Kernel_traits::ElementKVCacheFp8;
-    using ElementKVCache = std::conditional_t<Use_fp8_kv_cache, ElementKVCacheFp8, Element>;
+    using ElementKVCache = typename Kernel_traits::ElementKVCache;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
+    constexpr bool Use_fp8_kv_cache = Kernel_traits::Use_fp8_kv_cache;
 
     // Shared memory.
     extern __shared__ char smem_[];
@@ -745,28 +745,29 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                     tKgKnew, tKgK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
                 );
             }
-            // else {
-            //     if constexpr(!Use_fp8_kv_cache) {
-            //         if (params.is_rotary_interleaved) {
-            //             // Don't clear OOB_K because we're writing to global memory
-            //             flash::copy_rotary_interleaved<Is_even_K, /*Clear_OOB_K=*/false>(
-            //                 tKgKnew, tKgK, tRgCos, tRgSin, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
-            //                 binfo.seqlen_k_cache - n_block * kBlockN, params.d, params.rotary_dim
-            //             );
-            //             tRgCos.data() = tRgCos.data() + (-int(kBlockN * params.rotary_dim / 2));
-            //             tRgSin.data() = tRgSin.data() + (-int(kBlockN * params.rotary_dim / 2));
-            //         } else {
-            //             // Don't clear OOB_K because we're writing to global memory
-            //             flash::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
-            //                 tKgKnew, tKgK, tRgCosCont, tRgSinCont, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
-            //                 binfo.seqlen_k_cache - n_block * kBlockN, params.d, params.rotary_dim
-            //             );
-            //             tRgCosCont.data() = tRgCosCont.data() + (-int(kBlockN * params.rotary_dim / 2));
-            //             tRgSinCont.data() = tRgSinCont.data() + (-int(kBlockN * params.rotary_dim / 2));
+            else {
+                // not supported yet
+                if constexpr(!Use_fp8_kv_cache) {
+                    if (params.is_rotary_interleaved) {
+                        // Don't clear OOB_K because we're writing to global memory
+                        flash::copy_rotary_interleaved<Is_even_K, /*Clear_OOB_K=*/false>(
+                            tKgKnew, tKgK, tRgCos, tRgSin, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
+                            binfo.seqlen_k_cache - n_block * kBlockN, params.d, params.rotary_dim
+                        );
+                        tRgCos.data() = tRgCos.data() + (-int(kBlockN * params.rotary_dim / 2));
+                        tRgSin.data() = tRgSin.data() + (-int(kBlockN * params.rotary_dim / 2));
+                    } else {
+                        // Don't clear OOB_K because we're writing to global memory
+                        flash::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
+                            tKgKnew, tKgK, tRgCosCont, tRgSinCont, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
+                            binfo.seqlen_k_cache - n_block * kBlockN, params.d, params.rotary_dim
+                        );
+                        tRgCosCont.data() = tRgCosCont.data() + (-int(kBlockN * params.rotary_dim / 2));
+                        tRgSinCont.data() = tRgSinCont.data() + (-int(kBlockN * params.rotary_dim / 2));
 
-            //         }
-            //     }
-            // }
+                    }
+                }
+            }
             tKgKnew.data() = tKgKnew.data() + (-int(kBlockN * params.knew_row_stride));
             if (block_table == nullptr) {
                 tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
@@ -1080,7 +1081,7 @@ inline __device__ void compute_attn(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, bool Use_fp8_kv_cache, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1089,7 +1090,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV, Use_fp8_kv_cache>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

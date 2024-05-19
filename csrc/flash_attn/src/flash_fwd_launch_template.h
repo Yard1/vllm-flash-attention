@@ -3,7 +3,8 @@
  ******************************************************************************/
 
 #pragma once
-
+#include <torch/python.h>
+#include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 
 #include "static_switch.h"
@@ -35,9 +36,9 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, b
     #endif
 }
 
-DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, bool Use_fp8_kv_cache) {
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV) {
     #if defined(ARCH_SUPPORTS_FLASH)
-        flash::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV, Use_fp8_kv_cache>(params);
+        flash::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -108,21 +109,19 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
                     BOOL_SWITCH(params.num_splits > 1, Split, [&] {
                         BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
-                            BOOL_SWITCH(params.use_fp8_kv_cache, Use_fp8_kv_cache, [&] {
                                 ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
-                                    // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
-                                    // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                                    // If Is_local, set Is_causal to false
-                                    auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Split, Append_KV, Use_fp8_kv_cache>;
-                                    // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
-                                    // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
-                                    if (smem_size >= 48 * 1024) {
-                                        C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                                    }
-                                    kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                                    C10_CUDA_KERNEL_LAUNCH_CHECK();
-                                });
+                                // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
+                                // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                                // If Is_local, set Is_causal to false
+                                auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Split, Append_KV>;
+                                // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
+                                // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
+                                if (smem_size >= 48 * 1024) {
+                                    C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                                }
+                                kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                                C10_CUDA_KERNEL_LAUNCH_CHECK();
                             });
                         });
                     });
@@ -157,14 +156,14 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     }
 }
 
-template<typename T, int Headdim>
+template<typename T, int Headdim, bool Use_fp8_kv_cache>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockM = 64;  // Fixed for all head dimensions
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
     // Also for headdim 160 with block size 64 x 128 after the rotary addition.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
-    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>>(params, stream);
+    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T, Use_fp8_kv_cache>>(params, stream);
 }
 
 template<typename T>

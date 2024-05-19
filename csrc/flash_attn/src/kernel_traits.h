@@ -46,11 +46,10 @@ struct Flash_kernel_traits {
 };
 
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t, bool use_fp8_kv_cache=false,
          typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
 struct Flash_fwd_kernel_traits : public Base {
     using Element = typename Base::Element;
-    using ElementKVCacheFp8 = typename cutlass::float_e5m2_t;
     using ElementAccum = typename Base::ElementAccum;
     using index_t = typename Base::index_t;
     static constexpr bool Has_cp_async = Base::Has_cp_async;
@@ -71,6 +70,9 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+
+    static constexpr bool Use_fp8_kv_cache = use_fp8_kv_cache;
+    using ElementKVCache = std::conditional_t<Use_fp8_kv_cache, cutlass::float_e5m2_t, Element>;
 
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,

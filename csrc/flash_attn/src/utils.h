@@ -354,14 +354,13 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
     using From_type = typename Engine0::value_type;
     using To_type = typename Engine1::value_type;
-    constexpr bool uses_different_dtype = !std::is_same_v<From_type, To_type>;
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
         if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
             #pragma unroll
             for (int k = 0; k < size<2>(S); ++k) {
                 if (Is_even_K || predicate_K(k)) {
-                    if constexpr(uses_different_dtype) {
+                    if constexpr(!std::is_same_v<From_type, To_type>) {
                         Tensor S_reg = make_fragment_like(S(_, m, k));
                         cute::copy_aligned( S(_, m, k), S_reg);
                         Tensor D_reg = flash::convert_type<To_type>(S_reg);

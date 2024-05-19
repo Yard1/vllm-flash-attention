@@ -16,6 +16,7 @@ DTYPE_MAP = {
 
 SM = [80]  # Sm80 kernels support up to
 HEAD_DIMENSIONS = [32, 64, 96, 128, 160, 192, 224, 256]
+BOOL = [True, False]
 KERNEL_IMPL_TEMPLATE_FWD = """#include "flash_fwd_launch_template.h"
 
 template<>
@@ -26,7 +27,7 @@ void run_mha_fwd_<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t st
 
 KERNEL_IMPL_TEMPLATE_FWD_SPLIT = """#include "flash_fwd_launch_template.h"
 
-template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {USE_FP8_KVCACHE}>(Flash_fwd_params &params, cudaStream_t stream);
 """
 
 KERNEL_IMPL_TEMPLATE_BWD = """#include "flash_bwd_launch_template.h"
@@ -44,6 +45,7 @@ class Kernel:
     dtype: str
     head_dim: int
     direction: str
+    use_fp8_kv_cache: bool = False
 
     @property
     def template(self) -> str:
@@ -57,19 +59,22 @@ class Kernel:
             )
         else:
             return KERNEL_IMPL_TEMPLATE_FWD_SPLIT.format(
-                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
+                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, USE_FP8_KVCACHE=str(self.use_fp8_kv_cache).lower()
             )
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_sm{self.sm}.cu"
+        fp8_kv_cache = "_fp8kvcache" if self.use_fp8_kv_cache else ""
+        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}{fp8_kv_cache}_sm{self.sm}.cu"
 
 
 def get_all_kernels() -> List[Kernel]:
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM):
-        for direction in ["fwd", "bwd", "fwd_split"]:
+        for direction in ["fwd"]:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, direction=direction)
-
+    for dtype, head_dim, sm, use_fp8_kv_cache in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM, BOOL):
+        for direction in ["fwd_split"]:
+            yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, direction=direction, use_fp8_kv_cache=use_fp8_kv_cache)
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
     prelude = """// Copyright (c) 2023, Tri Dao.
