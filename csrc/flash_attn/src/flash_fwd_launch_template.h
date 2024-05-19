@@ -3,8 +3,6 @@
  ******************************************************************************/
 
 #pragma once
-#include <torch/python.h>
-#include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 
 #include "static_switch.h"
