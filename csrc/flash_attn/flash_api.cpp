@@ -144,7 +144,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
         HEADDIM_SWITCH(params.d, [&] {
             if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
                 TORCH_CHECK(!params.use_fp8_kv_cache, "fp8 kv cache not supported for non-split");
-                //run_mha_fwd_<elem_type, kHeadDim>(params, stream);
+                run_mha_fwd_<elem_type, kHeadDim>(params, stream);
             } 
             else if (params.use_fp8_kv_cache) {
                 run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, true>(params, stream);

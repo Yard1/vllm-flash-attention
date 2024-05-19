@@ -480,6 +480,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     using index_t = typename Kernel_traits::index_t;
     constexpr bool Use_fp8_kv_cache = Kernel_traits::Use_fp8_kv_cache;
 
+    if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("Use_fp8_kv_cache = %d, sizeof(Element) = %lu, sizeof(ElementKVCache) = %lu\n", Use_fp8_kv_cache, sizeof(Element), sizeof(ElementKVCache)); }
+
     // Shared memory.
     extern __shared__ char smem_[];
 
