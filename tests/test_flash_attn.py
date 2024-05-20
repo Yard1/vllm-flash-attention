@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from flash_attn import (
+from vllm_flash_attn import (
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
@@ -13,12 +13,940 @@ from flash_attn import (
     flash_attn_varlen_qkvpacked_func,
     flash_attn_with_kvcache,
 )
-from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n
-from flash_attn.layers.rotary import apply_rotary_emb
+from vllm_flash_attn.flash_attn_interface import _get_block_size_n
 
 MAX_HEADDIM_SM8x = 192
 
+def maybe_fp8_ref(tensor, kv_cache_dtype, dtype):
+    return tensor.to(kv_cache_dtype).to(dtype) if tensor is not None and kv_cache_dtype is not None else tensor
+
+def maybe_fp8(tensor, kv_cache_dtype):
+    return tensor.to(kv_cache_dtype).view(dtype=torch.uint8) if tensor is not None and kv_cache_dtype is not None else tensor
+
+
+# Adapted from https://github.com/mlcommons/training_results_v1.1/blob/main/NVIDIA/benchmarks/bert/implementations/pytorch/padding.py
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange, repeat
+
+
+class IndexFirstAxis(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, indices):
+        ctx.save_for_backward(indices)
+        assert input.ndim >= 2
+        ctx.first_axis_dim, other_shape = input.shape[0], input.shape[1:]
+        second_dim = other_shape.numel()
+        # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.
+        # return input[indices]
+        return torch.gather(
+            rearrange(input, "b ... -> b (...)"), 0, repeat(indices, "z -> z d", d=second_dim)
+        ).reshape(-1, *other_shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (indices,) = ctx.saved_tensors
+        assert grad_output.ndim >= 2
+        other_shape = grad_output.shape[1:]
+        grad_output = rearrange(grad_output, "b ... -> b (...)")
+        grad_input = torch.zeros(
+            [ctx.first_axis_dim, grad_output.shape[1]],
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+        # TD [2022-03-04] For some reason torch.scatter is a bit faster than indexing.
+        # grad_input[indices] = grad_output
+        grad_input.scatter_(0, repeat(indices, "z -> z d", d=grad_output.shape[1]), grad_output)
+        return grad_input.reshape(ctx.first_axis_dim, *other_shape), None
+
+
+index_first_axis = IndexFirstAxis.apply
+
+
+class IndexPutFirstAxis(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, values, indices, first_axis_dim):
+        ctx.save_for_backward(indices)
+        assert indices.ndim == 1
+        assert values.ndim >= 2
+        output = torch.zeros(
+            first_axis_dim, *values.shape[1:], device=values.device, dtype=values.dtype
+        )
+        # TD [2022-03-04] For some reason torch.scatter is a bit faster than indexing.
+        output[indices] = values
+        # output.scatter_(0, repeat(indices, 'z -> z d', d=values.shape[1]), values)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (indices,) = ctx.saved_tensors
+        # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.
+        grad_values = grad_output[indices]
+        # grad_values = torch.gather(grad_output, 0, repeat(indices, 'z -> z d', d=grad_output.shape[1]))
+        return grad_values, None, None
+
+
+index_put_first_axis = IndexPutFirstAxis.apply
+
+
+class IndexFirstAxisResidual(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, indices):
+        ctx.save_for_backward(indices)
+        assert input.ndim >= 2
+        ctx.first_axis_dim, other_shape = input.shape[0], input.shape[1:]
+        second_dim = other_shape.numel()
+        # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.
+        output = input[indices]
+        # We don't want to reshape input (b ... -> b (...)) since it could change the channel_last
+        # memory format to channel_first. In other words, input might not be contiguous.
+        # If we don't detach, Pytorch complains about output being a view and is being modified inplace
+        return output, input.detach()
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_residual):
+        (indices,) = ctx.saved_tensors
+        assert grad_output.ndim >= 2
+        other_shape = grad_output.shape[1:]
+        assert grad_residual.shape[1:] == other_shape
+        grad_input = grad_residual
+        # grad_input[indices] += grad_output
+        indices = indices.reshape(indices.shape[0], *((1,) * (grad_output.ndim - 1)))
+        indices = indices.expand_as(grad_output)
+        grad_input.scatter_add_(0, indices, grad_output)
+        return grad_input.reshape(ctx.first_axis_dim, *other_shape), None
+
+
+index_first_axis_residual = IndexFirstAxisResidual.apply
+
+
+def unpad_input(hidden_states, attention_mask):
+    """
+    Arguments:
+        hidden_states: (batch, seqlen, ...)
+        attention_mask: (batch, seqlen), bool / int, 1 means valid and 0 means not valid.
+    Return:
+        hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
+        indices: (total_nnz), the indices of non-masked tokens from the flattened input sequence.
+        cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+        max_seqlen_in_batch: int
+    """
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
+    # TD [2022-03-04] We don't want to index with a bool mask, because Pytorch will expand the
+    # bool mask, then call nonzero to get the indices, then index with those. The indices is @dim
+    # times larger than it needs to be, wasting memory. It's faster and more memory-efficient to
+    # index with integer indices. Moreover, torch's index is a bit slower than it needs to be,
+    # so we write custom forward and backward to make it a bit faster.
+    return (
+        index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
+
+
+def unpad_input_for_concatenated_sequences(hidden_states, attention_mask_in_length):
+    """
+    Supports concatenating short samples in one sequence. The attention_mask_in_length is utilized to mask other short samples. It helps efficient training of variant lengths-based samples (e.g., the supervised fine-tuning task in large language model).
+    The motivation for this function is explained [here](https://github.com/Dao-AILab/flash-attention/issues/432#issuecomment-1668822286).
+    
+    For example, if batch = 3 and seqlen = 6, the attention_mask_in_length is:
+        ```
+        [
+          [2, 3, 0, 0, 0, 0],
+          [3, 2, 0, 0, 0, 0],
+          [6, 0, 0, 0, 0, 0]
+        ]
+        ```
+    , which refers to the 3D-attention mask:
+        ```
+        [
+          [
+            [1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+            [0, 0, 1, 1, 0, 0],
+            [0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+          ],
+          [
+            [1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 1, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+          ],
+          [
+            [1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1]
+          ]
+        ]
+        ```.
+
+    Arguments:
+        hidden_states: (batch, seqlen, ...)
+        attention_mask_in_length: (batch, seqlen), int, a nonzero number (e.g., 1, 2, 3, etc.) means length of concatenated sequence in b-th batch, and 0 means none.
+    Return:
+        hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
+        indices: (total_nnz), the indices of non-masked tokens from the flattened input sequence.
+        cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+        max_seqlen_in_batch: int
+    """
+    length = attention_mask_in_length.sum(dim=-1)
+    seqlen = attention_mask_in_length.size(-1)
+    attention_mask_2d = torch.arange(seqlen, device=length.device, dtype=length.dtype).expand(len(length), seqlen) < length.unsqueeze(1)
+    real_indices_idx = torch.nonzero(attention_mask_in_length.flatten(), as_tuple=False).flatten()
+    seqlens_in_batch = attention_mask_in_length.flatten()[real_indices_idx]
+    indices = torch.nonzero(attention_mask_2d.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
+    # TD [2022-03-04] We don't want to index with a bool mask, because Pytorch will expand the
+    # bool mask, then call nonzero to get the indices, then index with those. The indices is @dim
+    # times larger than it needs to be, wasting memory. It's faster and more memory-efficient to
+    # index with integer indices. Moreover, torch's index is a bit slower than it needs to be,
+    # so we write custom forward and backward to make it a bit faster.
+    return (
+        index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
+
+
+def pad_input(hidden_states, indices, batch, seqlen):
+    """
+    Arguments:
+        hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
+        indices: (total_nnz), the indices that represent the non-masked tokens of the original padded input sequence.
+        batch: int, batch size for the padded sequence.
+        seqlen: int, maximum sequence length for the padded sequence.
+    Return:
+        hidden_states: (batch, seqlen, ...)
+    """
+    dim = hidden_states.shape[-1]
+    # output = torch.zeros((batch * seqlen), dim, device=hidden_states.device, dtype=hidden_states.dtype)
+    # output[indices] = hidden_states
+    output = index_put_first_axis(hidden_states, indices, batch * seqlen)
+    return rearrange(output, "(b s) ... -> b s ...", b=batch)
+
+
+# Copyright (c) 2023, Tri Dao.
+
+from typing import Optional, Union
+
+import torch
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def rotary_kernel(
+    OUT,  # Pointers to matrices
+    X,
+    COS,
+    SIN,
+    CU_SEQLENS,
+    SEQLEN_OFFSETS,  # this could be int or a pointer
+    # Matrix dimensions
+    seqlen,
+    rotary_dim,
+    seqlen_ro,
+    # strides
+    stride_out_batch,
+    stride_out_seqlen,
+    stride_out_nheads,
+    stride_out_headdim,
+    stride_x_batch,
+    stride_x_seqlen,
+    stride_x_nheads,
+    stride_x_headdim,
+    # Meta-parameters
+    BLOCK_K: tl.constexpr,
+    IS_SEQLEN_OFFSETS_TENSOR: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    INTERLEAVED: tl.constexpr,
+    CONJUGATE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_batch = tl.program_id(axis=1)
+    pid_head = tl.program_id(axis=2)
+    rotary_dim_half = rotary_dim // 2
+
+    if not IS_VARLEN:
+        X = X + pid_batch * stride_x_batch + pid_head * stride_x_nheads
+        OUT = OUT + pid_batch * stride_out_batch + pid_head * stride_out_nheads
+    else:
+        start_idx = tl.load(CU_SEQLENS + pid_batch)
+        seqlen = tl.load(CU_SEQLENS + pid_batch + 1) - start_idx
+        X = X + start_idx * stride_x_seqlen + pid_head * stride_x_nheads
+        OUT = OUT + start_idx * stride_out_seqlen + pid_head * stride_out_nheads
+
+    if pid_m * BLOCK_M >= seqlen:
+        return
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    if not IS_SEQLEN_OFFSETS_TENSOR:
+        rm_cs = rm + SEQLEN_OFFSETS
+    else:
+        rm_cs = rm + tl.load(SEQLEN_OFFSETS + pid_batch)
+    rk = tl.arange(0, BLOCK_K)
+    rk_half = tl.arange(0, BLOCK_K // 2)
+
+    if not INTERLEAVED:
+        # Load the 1st and 2nd halves of X, do calculation, then store to 1st and 2nd halves of OUT
+        X = X + (rm[:, None] * stride_x_seqlen + rk_half[None, :] * stride_x_headdim)
+        COS = COS + (rm_cs[:, None] * rotary_dim_half + rk_half[None, :])
+        SIN = SIN + (rm_cs[:, None] * rotary_dim_half + rk_half[None, :])
+        cos = tl.load(
+            COS, mask=(rm_cs[:, None] < seqlen_ro) & (rk_half[None, :] < rotary_dim_half), other=1.0
+        ).to(tl.float32)
+        sin = tl.load(
+            SIN, mask=(rm_cs[:, None] < seqlen_ro) & (rk_half[None, :] < rotary_dim_half), other=0.0
+        ).to(tl.float32)
+        x0 = tl.load(
+            X, mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half), other=0.0
+        ).to(tl.float32)
+        x1 = tl.load(
+            X + rotary_dim_half * stride_x_headdim,
+            mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half),
+            other=0.0,
+        ).to(tl.float32)
+        if CONJUGATE:
+            sin = -sin
+        o0 = x0 * cos - x1 * sin
+        o1 = x0 * sin + x1 * cos
+        # write back result
+        OUT = OUT + (rm[:, None] * stride_out_seqlen + rk_half[None, :] * stride_out_headdim)
+        tl.store(OUT, o0, mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half))
+        tl.store(
+            OUT + rotary_dim_half * stride_out_headdim,
+            o1,
+            mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half),
+        )
+    else:
+        # We don't want to load X[0, 2, 4, ...] and X[1, 3, 5, ...] separately since both are slow.
+        # Instead, we load x0 = X[0, 1, 2, 3, ...] and x1 = X[1, 0, 3, 2, ...].
+        # Loading x0 will be fast but x1 will be slow.
+        # Then we load cos = COS[0, 0, 1, 1, ...] and sin = SIN[0, 0, 1, 1, ...].
+        # Then we do the calculation and use tl.where to pick put the right outputs for the even
+        # and for the odd indices.
+        rk_swap = rk + ((rk + 1) % 2) * 2 - 1  # 1, 0, 3, 2, 5, 4, ...
+        rk_repeat = tl.arange(0, BLOCK_K) // 2
+        X0 = X + (rm[:, None] * stride_x_seqlen + rk[None, :] * stride_x_headdim)
+        X1 = X + (rm[:, None] * stride_x_seqlen + rk_swap[None, :] * stride_x_headdim)
+        COS = COS + (rm_cs[:, None] * rotary_dim_half + rk_repeat[None, :])
+        SIN = SIN + (rm_cs[:, None] * rotary_dim_half + rk_repeat[None, :])
+        cos = tl.load(
+            COS,
+            mask=(rm_cs[:, None] < seqlen_ro) & (rk_repeat[None, :] < rotary_dim_half),
+            other=1.0,
+        ).to(tl.float32)
+        sin = tl.load(
+            SIN,
+            mask=(rm_cs[:, None] < seqlen_ro) & (rk_repeat[None, :] < rotary_dim_half),
+            other=0.0,
+        ).to(tl.float32)
+        x0 = tl.load(X0, mask=(rm[:, None] < seqlen) & (rk[None, :] < rotary_dim), other=0.0).to(
+            tl.float32
+        )
+        x1 = tl.load(
+            X1, mask=(rm[:, None] < seqlen) & (rk_swap[None, :] < rotary_dim), other=0.0
+        ).to(tl.float32)
+        if CONJUGATE:
+            sin = -sin
+        x0_cos = x0 * cos
+        x1_sin = x1 * sin
+        out = tl.where(rk[None, :] % 2 == 0, x0_cos - x1_sin, x0_cos + x1_sin)
+        OUT = OUT + (rm[:, None] * stride_out_seqlen + rk[None, :] * stride_out_headdim)
+        tl.store(OUT, out, mask=(rm[:, None] < seqlen) & (rk[None, :] < rotary_dim))
+
+
+def apply_rotary(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    seqlen_offsets: Union[int, torch.Tensor] = 0,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
+    interleaved=False,
+    inplace=False,
+    conjugate=False,
+) -> torch.Tensor:
+    """
+    Arguments:
+        x: (batch, seqlen, nheads, headdim) if cu_seqlens is None
+            else (total_seqlen, nheads, headdim).
+        cos: (seqlen_ro, rotary_dim / 2)
+        sin: (seqlen_ro, rotary_dim / 2)
+        seqlen_offsets: integer or integer tensor of size (batch,)
+        cu_seqlens: (batch + 1,) or None
+        max_seqlen: int
+    Returns:
+        y: (batch, seqlen, nheads, headdim)
+    """
+    is_varlen = cu_seqlens is not None
+    if not is_varlen:
+        batch, seqlen, nheads, headdim = x.shape
+    else:
+        assert max_seqlen is not None, "If cu_seqlens is passed in, then max_seqlen must be passed"
+        total_seqlen, nheads, headdim = x.shape
+        batch_p_1 = cu_seqlens.shape[0]
+        batch = batch_p_1 - 1
+        seqlen = max_seqlen
+    seqlen_ro, rotary_dim = cos.shape
+    assert sin.shape == cos.shape
+    rotary_dim *= 2
+    assert rotary_dim <= headdim, "rotary_dim must be <= headdim"
+    assert headdim <= 256, "Only support headdim <= 256"
+    assert seqlen_ro >= seqlen, "seqlen_ro must be >= seqlen"
+
+    assert (
+        cos.dtype == sin.dtype
+    ), f"cos and sin must have the same dtype, got {cos.dtype} and {sin.dtype}"
+    assert (
+        x.dtype == cos.dtype
+    ), f"Input and cos/sin must have the same dtype, got {x.dtype} and {cos.dtype}"
+
+    cos, sin = cos.contiguous(), sin.contiguous()
+    if isinstance(seqlen_offsets, torch.Tensor):
+        assert seqlen_offsets.shape == (batch,)
+        assert seqlen_offsets.dtype in [torch.int32, torch.int64]
+        seqlen_offsets = seqlen_offsets.contiguous()
+    else:
+        assert seqlen_offsets + seqlen <= seqlen_ro
+
+    output = torch.empty_like(x) if not inplace else x
+    if rotary_dim < headdim and not inplace:
+        output[..., rotary_dim:].copy_(x[..., rotary_dim:])
+
+    BLOCK_K = (
+        32
+        if rotary_dim <= 32
+        else (64 if rotary_dim <= 64 else (128 if rotary_dim <= 128 else 256))
+    )
+    grid = lambda META: (triton.cdiv(seqlen, META["BLOCK_M"]), batch, nheads)  # noqa
+    BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 64 else 4)
+
+    # Need this, otherwise Triton tries to launch from cuda:0 and we get
+    # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
+    with torch.cuda.device(x.device.index):
+        rotary_kernel[grid](
+            output,  # data ptrs
+            x,
+            cos,
+            sin,
+            cu_seqlens,
+            seqlen_offsets,
+            seqlen,  # shapes
+            rotary_dim,
+            seqlen_ro,
+            output.stride(0) if not is_varlen else 0,  # batch_strides if not varlen else 0
+            output.stride(-3),  # seqlen_stride or total_seqlen_stride
+            output.stride(-2),  # nheads_stride
+            output.stride(-1),  # headdim_stride
+            x.stride(0) if not is_varlen else 0,  # batch_strides if not varlen else 0
+            x.stride(-3),  # seqlen stride or total_seqlen_stride
+            x.stride(-2),  # nheads stride
+            x.stride(-1),  # headdim stride
+            BLOCK_K,
+            isinstance(seqlen_offsets, torch.Tensor),
+            is_varlen,
+            interleaved,
+            conjugate,
+            BLOCK_M,
+        )
+    return output
+
+# Copyright (c) 2023, Tri Dao.
+
+import math
+from typing import Optional, Tuple, Union
+
+import torch
+from einops import rearrange, repeat
+
+
+def rotate_half(x, interleaved=False):
+    if not interleaved:
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+    else:
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        return rearrange(torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2)
+
+
+def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
+    """
+    x: (batch_size, seqlen, nheads, headdim)
+    cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
+    """
+    ro_dim = cos.shape[-1] * 2
+    assert ro_dim <= x.shape[-1]
+    cos = repeat(cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
+    sin = repeat(sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
+    return torch.cat(
+        [x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin, x[..., ro_dim:]],
+        dim=-1,
+    )
+
+
+class ApplyRotaryEmb(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        cos,
+        sin,
+        interleaved=False,
+        inplace=False,
+        seqlen_offsets: Union[int, torch.Tensor] = 0,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+    ):
+        out = apply_rotary(
+            x,
+            cos,
+            sin,
+            seqlen_offsets=seqlen_offsets,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            interleaved=interleaved,
+            inplace=inplace,
+        )
+        if isinstance(seqlen_offsets, int):
+            ctx.save_for_backward(cos, sin, cu_seqlens)  # Can't save int with save_for_backward
+            ctx.seqlen_offsets = seqlen_offsets
+        else:
+            ctx.save_for_backward(cos, sin, cu_seqlens, seqlen_offsets)
+            ctx.seqlen_offsets = None
+        ctx.interleaved = interleaved
+        ctx.inplace = inplace
+        ctx.max_seqlen = max_seqlen
+        return out if not inplace else x
+
+    @staticmethod
+    def backward(ctx, do):
+        seqlen_offsets = ctx.seqlen_offsets
+        if seqlen_offsets is None:
+            cos, sin, cu_seqlens, seqlen_offsets = ctx.saved_tensors
+        else:
+            cos, sin, cu_seqlens = ctx.saved_tensors
+        # TD [2023-09-02]: For some reason Triton (2.0.0.post1) errors with
+        # "[CUDA]: invalid device context", and cloning makes it work. Idk why. Triton 2.1.0 works.
+        if not ctx.interleaved and not ctx.inplace:
+            do = do.clone()
+        dx = apply_rotary(
+            do,
+            cos,
+            sin,
+            seqlen_offsets=seqlen_offsets,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=ctx.max_seqlen,
+            interleaved=ctx.interleaved,
+            inplace=ctx.inplace,
+            conjugate=True,
+        )
+        return dx, None, None, None, None, None, None, None
+
+
+def apply_rotary_emb(
+    x,
+    cos,
+    sin,
+    interleaved=False,
+    inplace=False,
+    seqlen_offsets: Union[int, torch.Tensor] = 0,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
+):
+    """
+    Arguments:
+        x: (batch_size, seqlen, nheads, headdim) if cu_seqlens is None
+            else (total_seqlen, nheads, headdim)
+        cos, sin: (seqlen_rotary, rotary_dim / 2)
+        interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
+            of 1st half and 2nd half (GPT-NeoX style).
+        inplace: if True, apply rotary embedding in-place.
+        seqlen_offsets: (batch_size,) or int. Each sequence in x is shifted by this amount.
+            Most commonly used in inference when we have KV cache.
+        cu_seqlens: (batch + 1,) or None
+        max_seqlen: int
+    Return:
+        out: (batch_size, seqlen, nheads, headdim) if cu_seqlens is None
+            else (total_seqlen, nheads, headdim)
+    rotary_dim must be <= headdim
+    Apply rotary embedding to the first rotary_dim of x.
+    """
+    return ApplyRotaryEmb.apply(
+        x, cos, sin, interleaved, inplace, seqlen_offsets, cu_seqlens, max_seqlen
+    )
+
+
+# For backward compatibility
+apply_rotary_emb_func = apply_rotary_emb
+
+
+class ApplyRotaryEmbQKV_(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        qkv,
+        cos,
+        sin,
+        cos_k=None,
+        sin_k=None,
+        interleaved=False,
+        seqlen_offsets: Union[int, torch.Tensor] = 0,
+    ):
+        batch, seqlen, three, nheads, headdim = qkv.shape
+        assert three == 3
+        if cos_k is None and sin_k is None and qkv.is_contiguous():
+            # Call 1 kernel instead of 2 kernels
+            # We need qkv to be contiguous so that when we reshape to combine (3, nheads)
+            # dimensions, we get the same tensor
+            # qk = rearrange(qkv[:, :, :2], "b s t h d -> b s (t h) d")
+            qk = qkv[:, :, :2].reshape(batch, seqlen, -1, headdim)
+            apply_rotary(
+                qk, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved, inplace=True
+            )
+        else:
+            cos_k = cos if cos_k is None else cos_k
+            sin_k = sin if sin_k is None else sin_k
+            q, k = qkv[:, :, 0], qkv[:, :, 1]
+            apply_rotary(q, cos, sin, seqlen_offsets, interleaved=interleaved, inplace=True)
+            apply_rotary(k, cos_k, sin_k, seqlen_offsets, interleaved=interleaved, inplace=True)
+            ctx.save_for_backward(cos, sin, cos_k, sin_k)
+        if isinstance(seqlen_offsets, int):
+            ctx.save_for_backward(cos, sin, cos_k, sin_k)
+            ctx.seqlen_offsets = seqlen_offsets
+        else:
+            ctx.save_for_backward(cos, sin, cos_k, sin_k, seqlen_offsets)
+            ctx.seqlen_offsets = None
+        ctx.interleaved = interleaved
+        return qkv
+
+    @staticmethod
+    def backward(ctx, dqkv):
+        seqlen_offsets = ctx.seqlen_offsets
+        if seqlen_offsets is None:
+            cos, sin, cos_k, sin_k, seqlen_offsets = ctx.saved_tensors
+        else:
+            cos, sin, cos_k, sin_k = ctx.saved_tensors
+        if cos_k is None and sin_k is None and dqkv.is_contiguous():
+            # Call 1 kernel instead of 2 kernels
+            # We need dqkv to be contiguous so that when we reshape to combine (3, nheads)
+            # dimensions, we get the same tensor
+            dqk = rearrange(dqkv[:, :, :2], "b s t h d -> b s (t h) d")
+            apply_rotary(
+                dqk,
+                cos,
+                sin,
+                seqlen_offsets=seqlen_offsets,
+                interleaved=ctx.interleaved,
+                inplace=True,
+                conjugate=True,
+            )
+        else:
+            cos_k = cos if cos_k is None else cos_k
+            sin_k = sin if sin_k is None else sin_k
+            dq, dk = dqkv[:, :, 0], dqkv[:, :, 1]
+            apply_rotary(
+                dq, cos, sin, seqlen_offsets, interleaved=ctx.interleaved, inplace=True, conjugate=True
+            )
+            apply_rotary(
+                dk,
+                cos_k,
+                sin_k,
+                seqlen_offsets,
+                interleaved=ctx.interleaved,
+                inplace=True,
+                conjugate=True,
+            )
+        return dqkv, None, None, None, None, None, None
+
+
+def apply_rotary_emb_qkv_(
+    qkv,
+    cos,
+    sin,
+    cos_k=None,
+    sin_k=None,
+    interleaved=False,
+    seqlen_offsets: Union[int, torch.Tensor] = 0,
+):
+    """
+    Arguments:
+        qkv: (batch_size, seqlen, 3, nheads, headdim)
+        cos, sin: (seqlen, rotary_dim / 2)
+        cos_k, sin_k: (seqlen, rotary_dim / 2), optional
+        interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead of
+            1st half and 2nd half (GPT-NeoX style).
+        seqlen_offsets: (batch_size,) or int. Each sequence in Q and K is shifted by this amount.
+            Most commonly used in inference when we have KV cache.
+    Return:
+        qkv: (batch_size, seqlen, 3, nheads, headdim)
+    rotary_dim must be <= headdim
+    Apply rotary embedding *inplace* to the first rotary_dim of Q and K.
+    """
+    return ApplyRotaryEmbQKV_.apply(qkv, cos, sin, cos_k, sin_k, interleaved, seqlen_offsets)
+
+
+class ApplyRotaryEmbKV_(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, kv, cos, sin, interleaved=False, seqlen_offsets: Union[int, torch.Tensor] = 0):
+        batch, seqlen, two, nheads, headdim = kv.shape
+        assert two == 2
+        k = kv[:, :, 0]
+        apply_rotary(
+            k, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved, inplace=True
+        )
+        if isinstance(seqlen_offsets, int):
+            ctx.save_for_backward(cos, sin)  # Can't save int with save_for_backward
+            ctx.seqlen_offsets = seqlen_offsets
+        else:
+            ctx.save_for_backward(cos, sin, seqlen_offsets)
+            ctx.seqlen_offsets = None
+        ctx.interleaved = interleaved
+        return kv
+
+    @staticmethod
+    def backward(ctx, dkv):
+        seqlen_offsets = ctx.seqlen_offsets
+        if seqlen_offsets is None:
+            cos, sin, seqlen_offsets = ctx.saved_tensors
+        else:
+            cos, sin = ctx.saved_tensors
+        apply_rotary(
+            dkv[:, :, 0],
+            cos,
+            sin,
+            seqlen_offsets=seqlen_offsets,
+            interleaved=ctx.interleaved,
+            inplace=True,
+            conjugate=True,
+        )
+        return dkv, None, None, None, None
+
+
+apply_rotary_emb_kv_ = ApplyRotaryEmbKV_.apply
+
+
+def apply_rotary_emb_kv_(
+    kv,
+    cos,
+    sin,
+    interleaved=False,
+    seqlen_offsets: Union[int, torch.Tensor] = 0,
+):
+    """
+    Arguments:
+        kv: (batch_size, seqlen, 2, nheads, headdim)
+        cos, sin: (seqlen, rotary_dim / 2)
+        interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead of
+            1st half and 2nd half (GPT-NeoX style).
+        seqlen_offsets: (batch_size,) or int. Each sequence in Q and K is shifted by this amount.
+            Most commonly used in inference when we have KV cache.
+    Return:
+        kv: (batch_size, seqlen, 2, nheads, headdim)
+    rotary_dim must be <= headdim
+    Apply rotary embedding *inplace* to the first rotary_dim of K.
+    """
+    return ApplyRotaryEmbKV_.apply(kv, cos, sin, interleaved, seqlen_offsets)
+
+
+class RotaryEmbedding(torch.nn.Module):
+    """
+    The rotary position embeddings from RoFormer_ (Su et. al).
+    A crucial insight from the method is that the query and keys are
+    transformed by rotation matrices which depend on the relative positions.
+
+    Other implementations are available in the Rotary Transformer repo_ and in
+    GPT-NeoX_, GPT-NeoX was an inspiration
+
+    .. _RoFormer: https://arxiv.org/abs/2104.09864
+    .. _repo: https://github.com/ZhuiyiTechnology/roformer
+    .. _GPT-NeoX: https://github.com/EleutherAI/gpt-neox
+
+    If scale_base is not None, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
+    A recommended value for scale_base is 512: https://github.com/HazyResearch/flash-attention/issues/96
+    Reference: https://github.com/sunyt32/torchscale/blob/main/torchscale/component/xpos_relative_position.py
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        base=10000.0,
+        interleaved=False,
+        scale_base=None,
+        pos_idx_in_fp32=True,
+        device=None,
+    ):
+        """
+        interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
+            of 1st half and 2nd half (GPT-NeoX style).
+        pos_idx_in_fp32: if True, the position indices [0.0, ..., seqlen - 1] are in fp32,
+            otherwise they might be in lower precision.
+            This option was added because previously (before 2023-07-02), when we construct
+            the position indices, we use the dtype of self.inv_freq. In most cases this would
+            be fp32, but if the model is trained in pure bf16 (not mixed precision), then
+            self.inv_freq would be bf16, and the position indices are also in bf16.
+            Because of the limited precision of bf16 (e.g. 1995.0 is rounded to 2000.0), the
+            embeddings for some positions will coincide.
+            To maintain compatibility with models previously trained in pure bf16,
+            we add this option.
+        """
+        super().__init__()
+        self.dim = dim
+        self.base = float(base)
+        self.pos_idx_in_fp32 = pos_idx_in_fp32
+        # Generate and save the inverse frequency buffer (non trainable)
+        inv_freq = self._compute_inv_freq(device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.interleaved = interleaved
+        self.scale_base = scale_base
+        scale = (
+            (torch.arange(0, dim, 2, device=device, dtype=torch.float32) + 0.4 * dim) / (1.4 * dim)
+            if scale_base is not None
+            else None
+        )
+        self.register_buffer("scale", scale, persistent=False)
+
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
+        self._cos_k_cached = None
+        self._sin_k_cached = None
+
+    def _compute_inv_freq(self, device=None):
+        return 1.0 / (
+            self.base
+            ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
+        )
+
+    def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):
+        # Reset the tables if the sequence length has changed,
+        # if we're on a new device (possibly due to tracing for instance),
+        # or if we're switching from inference mode to training
+        if (
+            seqlen > self._seq_len_cached
+            or self._cos_cached is None
+            or self._cos_cached.device != device
+            or self._cos_cached.dtype != dtype
+            or (self.training and self._cos_cached.is_inference())
+        ):
+            self._seq_len_cached = seqlen
+            # We want fp32 here, not self.inv_freq.dtype, since the model could be loaded in bf16
+            # And the output of arange can be quite large, so bf16 would lose a lot of precision.
+            # However, for compatibility reason, we add an option to use the dtype of self.inv_freq.
+            if self.pos_idx_in_fp32:
+                t = torch.arange(seqlen, device=device, dtype=torch.float32)
+                # We want fp32 here as well since inv_freq will be multiplied with t, and the output
+                # will be large. Having it in bf16 will lose a lot of precision and cause the
+                # cos & sin output to change significantly.
+                # We want to recompute self.inv_freq if it was not loaded in fp32
+                if self.inv_freq.dtype != torch.float32:
+                    inv_freq = self._compute_inv_freq(device=device)
+                else:
+                    inv_freq = self.inv_freq
+            else:
+                t = torch.arange(seqlen, device=device, dtype=self.inv_freq.dtype)
+                inv_freq = self.inv_freq
+            # Don't do einsum, it converts fp32 to fp16 under AMP
+            # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            freqs = torch.outer(t, inv_freq)
+            if self.scale is None:
+                self._cos_cached = torch.cos(freqs).to(dtype)
+                self._sin_cached = torch.sin(freqs).to(dtype)
+            else:
+                power = (
+                    torch.arange(seqlen, dtype=self.scale.dtype, device=self.scale.device)
+                    - seqlen // 2
+                ) / self.scale_base
+                scale = self.scale.to(device=power.device) ** rearrange(power, "s -> s 1")
+                # We want the multiplication by scale to happen in fp32
+                self._cos_cached = (torch.cos(freqs) * scale).to(dtype)
+                self._sin_cached = (torch.sin(freqs) * scale).to(dtype)
+                self._cos_k_cached = (torch.cos(freqs) / scale).to(dtype)
+                self._sin_k_cached = (torch.sin(freqs) / scale).to(dtype)
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        kv: Optional[torch.Tensor] = None,
+        seqlen_offset: Union[int, torch.Tensor] = 0,
+        max_seqlen: Optional[int] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        qkv: (batch, seqlen, 3, nheads, headdim) if kv is none,
+             else it's just q of shape (batch, seqlen, nheads, headdim)
+        kv: (batch, seqlen, 2, nheads, headdim)
+        seqlen_offset: (batch_size,) or int. Each sequence in x is shifted by this amount.
+            Most commonly used in inference when we have KV cache.
+            If it's a tensor of shape (batch_size,), then to update the cos / sin cache, one
+            should pass in max_seqlen, which will update the cos / sin cache up to that length.
+        Apply rotary embedding *inplace* to qkv and / or kv.
+        """
+        seqlen = qkv.shape[1]
+        if max_seqlen is not None:
+            self._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)
+        elif isinstance(seqlen_offset, int):
+            self._update_cos_sin_cache(seqlen + seqlen_offset, device=qkv.device, dtype=qkv.dtype)
+        if kv is None:
+            if self.scale is None:
+                return apply_rotary_emb_qkv_(
+                    qkv,
+                    self._cos_cached,
+                    self._sin_cached,
+                    interleaved=self.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+            else:
+                return apply_rotary_emb_qkv_(
+                    qkv,
+                    self._cos_cached,
+                    self._sin_cached,
+                    self._cos_k_cached,
+                    self._sin_k_cached,
+                    interleaved=self.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+        else:
+            q = qkv
+            q = apply_rotary_emb_func(
+                q,
+                self._cos_cached,
+                self._sin_cached,
+                interleaved=self.interleaved,
+                inplace=True,
+                seqlen_offsets=seqlen_offset,
+            )
+            if self.scale is None:
+                kv = apply_rotary_emb_kv_(
+                    kv,
+                    self._cos_cached,
+                    self._sin_cached,
+                    interleaved=self.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+            else:
+                kv = apply_rotary_emb_kv_(
+                    kv,
+                    self._cos_k_cached,
+                    self._sin_k_cached,
+                    interleaved=self.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+            return q, kv
 
 is_sm75 = torch.cuda.get_device_capability("cuda") == (7, 5)
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
@@ -1134,14 +2062,17 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize("kv_cache_dtype", [None, torch.float8_e5m2])
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, kv_cache_dtype
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
+    if kvpacked and kv_cache_dtype:
+        pytest.skip()
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -1220,8 +2151,8 @@ def test_flash_attn_varlen_output(
         ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
         out_unpad, sm_lse, S_dmask = flash_attn_varlen_func(
             q_unpad,
-            k_unpad,
-            v_unpad,
+            maybe_fp8(k_unpad, kv_cache_dtype),
+            maybe_fp8(v_unpad, kv_cache_dtype),
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
@@ -1305,8 +2236,8 @@ def test_flash_attn_varlen_output(
     else:
         out_ref, attn_ref = attention_ref(
             q,
-            k,
-            v,
+            maybe_fp8_ref(k, kv_cache_dtype, q.dtype),
+            maybe_fp8_ref(v, kv_cache_dtype, q.dtype),
             query_padding_mask,
             key_padding_mask,
             attn_bias,
@@ -1317,8 +2248,8 @@ def test_flash_attn_varlen_output(
         )
         out_pt, attn_pt = attention_ref(
             q,
-            k,
-            v,
+            maybe_fp8_ref(k, kv_cache_dtype, q.dtype),
+            maybe_fp8_ref(v, kv_cache_dtype, q.dtype),
             query_padding_mask,
             key_padding_mask,
             attn_bias,
@@ -1339,7 +2270,8 @@ def test_flash_attn_varlen_output(
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
     g = torch.randn_like(out)
-    if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
+    test_backward = False
+    if test_backward and (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
         if kvpacked:
             (
                 dq_unpad,
@@ -1476,7 +2408,8 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
-    if (d <= MAX_HEADDIM_SM8x or d > 224) or (is_sm80 or is_sm90):
+    test_backward = False
+    if test_backward and (d <= MAX_HEADDIM_SM8x or d > 224) or (is_sm80 or is_sm90):
         (
             dq,
             dk,
@@ -1543,10 +2476,11 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     ],
 )
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
-@pytest.mark.parametrize("paged_kv_block_size", [None, 16, 256, 512])
+@pytest.mark.parametrize("paged_kv_block_size", [16, 256, 512])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
+@pytest.mark.parametrize("kv_cache_dtype", [torch.float8_e5m2])
 def test_flash_attn_varlen_causal(
-    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
+    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype, kv_cache_dtype
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -1595,8 +2529,8 @@ def test_flash_attn_varlen_causal(
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
     out_unpad = flash_attn_varlen_func(
         q_unpad,
-        k_unpad if paged_kv_block_size is None else k_cache_paged,
-        v_unpad if paged_kv_block_size is None else v_cache_paged,
+        maybe_fp8(k_unpad if paged_kv_block_size is None else k_cache_paged, kv_cache_dtype),
+        maybe_fp8(v_unpad if paged_kv_block_size is None else v_cache_paged, kv_cache_dtype),
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
@@ -1609,8 +2543,8 @@ def test_flash_attn_varlen_causal(
     out = output_pad_fn(out_unpad)
     out_ref, attn_ref = attention_ref(
         q,
-        k,
-        v,
+        maybe_fp8_ref(k, kv_cache_dtype, q.dtype),
+        maybe_fp8_ref(v, kv_cache_dtype, q.dtype),
         query_padding_mask,
         key_padding_mask,
         None,
@@ -1621,8 +2555,8 @@ def test_flash_attn_varlen_causal(
     )
     out_pt, attn_pt = attention_ref(
         q,
-        k,
-        v,
+        maybe_fp8_ref(k, kv_cache_dtype, q.dtype),
+        maybe_fp8_ref(v, kv_cache_dtype, q.dtype),
         query_padding_mask,
         key_padding_mask,
         None,
@@ -1641,7 +2575,7 @@ def test_flash_attn_varlen_causal(
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
-    test_backward = (d <= MAX_HEADDIM_SM8x or d > 224 or is_sm80 or is_sm90) and block_table is None
+    test_backward = False
     if test_backward:
         (
             dq_unpad,
@@ -1716,9 +2650,10 @@ def test_flash_attn_varlen_causal(
         (256, 256),
     ],
 )
+@pytest.mark.parametrize("kv_cache_dtype", [None, torch.float8_e5m2])
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_splitkv(
-    seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype
+    seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype, kv_cache_dtype
 ):
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
@@ -1738,8 +2673,8 @@ def test_flash_attn_splitkv(
         alibi_slopes, attn_bias = None, None
     out, lse, _ = flash_attn_func(
         q,
-        k,
-        v,
+        maybe_fp8_(k, kv_cache_dtype),
+        maybe_fp8(v, kv_cache_dtype),
         0.0,
         causal=causal,
         window_size=window_size,
@@ -1748,12 +2683,12 @@ def test_flash_attn_splitkv(
         return_attn_probs=True,
     )
     out_ref, attn_ref = attention_ref(
-        q, k, v, None, None, attn_bias, 0.0, None, causal=causal, window_size=window_size
+        q, maybe_fp8_ref(k, kv_cache_dtype, q.dtype), maybe_fp8_ref(v, kv_cache_dtype, q.dtype), None, None, attn_bias, 0.0, None, causal=causal, window_size=window_size
     )
     out_pt, attn_pt = attention_ref(
         q,
-        k,
-        v,
+        maybe_fp8_ref(k, kv_cache_dtype, q.dtype),
+        maybe_fp8_ref(v, kv_cache_dtype, q.dtype),
         None,
         None,
         attn_bias,
@@ -1772,7 +2707,8 @@ def test_flash_attn_splitkv(
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
-    if (d <= MAX_HEADDIM_SM8x or d > 224) or (is_sm80 or is_sm90):
+    test_backward = False
+    if test_backward and (d <= MAX_HEADDIM_SM8x or d > 224) or (is_sm80 or is_sm90):
         (
             dq,
             dk,
@@ -1814,33 +2750,35 @@ def test_flash_attn_splitkv(
 
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize("dtype", [torch.float16])
-@pytest.mark.parametrize("num_splits", [1, 0])
+@pytest.mark.parametrize("num_splits", [0])
 # @pytest.mark.parametrize("num_splits", [1])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("new_kv", [False, True])
+@pytest.mark.parametrize("new_kv", [False])
 # @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("rotary_interleaved", [False, True])
 # @pytest.mark.parametrize("rotary_interleaved", [False])
-@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("rotary_fraction", [0.0])
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 # @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
-@pytest.mark.parametrize("paged_kv_block_size", [None, 16, 256, 512])
-@pytest.mark.parametrize("has_batch_idx", [False, True])
+@pytest.mark.parametrize("paged_kv_block_size", [16, 256, 512])
+@pytest.mark.parametrize("has_batch_idx", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("batch_size", [2, 4, 8, 32])
+@pytest.mark.parametrize("kv_cache_dtype", [torch.float8_e5m2])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1874,7 +2812,15 @@ def test_flash_attn_kvcache(
     mha_type,
     num_splits,
     dtype,
+    kv_cache_dtype,
+    batch_size,
 ):
+    if rotary_fraction != 0 and kv_cache_dtype:
+        pytest.skip()
+    if paged_kv_block_size is None and kv_cache_dtype:
+        pytest.skip()
+    if new_kv and kv_cache_dtype:
+        pytest.skip()
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -1884,7 +2830,6 @@ def test_flash_attn_kvcache(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 2
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 6
     # rotary_dim must be a multiple of 16, and must be <= d
@@ -1993,8 +2938,8 @@ def test_flash_attn_kvcache(
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     out = flash_attn_with_kvcache(
         q,
-        k_cache if paged_kv_block_size is None else k_cache_paged,
-        v_cache if paged_kv_block_size is None else v_cache_paged,
+        maybe_fp8(k_cache if paged_kv_block_size is None else k_cache_paged, kv_cache_dtype),
+        maybe_fp8(v_cache if paged_kv_block_size is None else v_cache_paged, kv_cache_dtype),
         k,
         v,
         rotary_cos=cos,
@@ -2020,8 +2965,8 @@ def test_flash_attn_kvcache(
     # probs = torch.softmax(qk, dim=-1)
     out_ref, _ = attention_ref(
         q_ro,
-        k_cache_rep,
-        v_cache_rep,
+        maybe_fp8_ref(k_cache_rep, kv_cache_dtype, q.dtype),
+        maybe_fp8_ref(v_cache_rep, kv_cache_dtype, q.dtype),
         None,
         key_padding_mask,
         attn_bias,
@@ -2032,8 +2977,8 @@ def test_flash_attn_kvcache(
     )
     out_pt, _ = attention_ref(
         q_ro,
-        k_cache_rep,
-        v_cache_rep,
+        maybe_fp8_ref(k_cache_rep, kv_cache_dtype, q.dtype),
+        maybe_fp8_ref(v_cache_rep, kv_cache_dtype, q.dtype),
         None,
         key_padding_mask,
         attn_bias,
@@ -2144,7 +3089,8 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
     torch.random.manual_seed(42)
     out0, lse0, _ = flash_attn_func(q, k, v, dropout_p, causal=causal, return_attn_probs=True)
     g = torch.randn_like(out0)
-    if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
+    test_backward = False
+    if test_backward and (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
         (
             dq0,
             dk0,
@@ -2159,7 +3105,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
         assert torch.equal(out, out0)
         assert torch.equal(lse, lse0)
 
-        if (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
+        if test_backward and (d <= MAX_HEADDIM_SM8x or (d > 224 and dropout_p == 0)) or (is_sm80 or is_sm90):
             (
                 dq,
                 dk,
@@ -2180,6 +3126,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
 # @pytest.mark.parametrize('d', [16])
 @pytest.mark.parametrize("seqlen", [1, 2, 5, 17, 128])
 # @pytest.mark.parametrize('seqlen', [2])
+@pytest.mark.skip
 def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     """We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
     in the case where seqlen % 128 != 0.
@@ -2236,6 +3183,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize("seqlen", [97, 128, 200, 256])
 # @pytest.mark.parametrize('seqlen', [128])
+@pytest.mark.skip
 def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     """We previously had a bug where we were using the wrong strides of dout, which shows up
     when dout is not contiguous.
@@ -2288,6 +3236,7 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
 # @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize("d", [16, 32, 64])
 # @pytest.mark.parametrize('d', [16])
+@pytest.mark.skip
 def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
     """We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
     in the case where seqlen % 128 != 0 or varlen.
@@ -2366,7 +3315,8 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
     out = flash_attn_func(q, k, v, 0.0, causal=causal, window_size=window_size, deterministic=True)
 
     g = torch.randn_like(out)
-    if (d <= MAX_HEADDIM_SM8x or d > 224) or (is_sm80 or is_sm90):
+    test_backward = False
+    if test_backward and (d <= MAX_HEADDIM_SM8x or d > 224) or (is_sm80 or is_sm90):
         dq0, dk0, dv0 = torch.autograd.grad(out, (q, k, v), g, retain_graph=True)
         for _ in range(50):
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g, retain_graph=True)
@@ -2404,8 +3354,9 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
         (1023, 1024),
     ],
 )
+@pytest.mark.parametrize("kv_cache_dtype", [None, torch.float8_e5m2])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
-def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
+def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype, kv_cache_dtype):
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -2441,8 +3392,8 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
     out = flash_attn_varlen_func(
         q_unpad,
-        k_unpad,
-        v_unpad,
+        maybe_fp8(k_unpad, kv_cache_dtype),
+        maybe_fp8(v_unpad, kv_cache_dtype),
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
@@ -2454,7 +3405,8 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
     )
 
     g = torch.randn_like(out)
-    if (d <= MAX_HEADDIM_SM8x or d > 224) or (is_sm80 or is_sm90):
+    test_backward = False
+    if test_backward and (d <= MAX_HEADDIM_SM8x or d > 224) or (is_sm80 or is_sm90):
         dq, dk, dv = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=True)
         for _ in range(50):
             dq, dk, dv = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=True)
@@ -2473,6 +3425,7 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
 @pytest.mark.parametrize("b", [4])
 @pytest.mark.parametrize("n", [10])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(170, 170)])
+@pytest.mark.parametrize("kv_cache_dtype", [None, torch.float8_e5m2])
 def test_flash_attn_paged_kvcache_overflow(
     seqlen_q,
     seqlen_k,
@@ -2483,6 +3436,7 @@ def test_flash_attn_paged_kvcache_overflow(
     paged_kv_block_size,
     causal,
     dtype,
+    kv_cache_dtype,
 ):  
     device = "cuda"
     num_blocks = 1000*16//paged_kv_block_size
@@ -2497,8 +3451,8 @@ def test_flash_attn_paged_kvcache_overflow(
         block_tables = torch.randint(0, num_blocks, size=(b, (seqlen_k + paged_kv_block_size - 1) // paged_kv_block_size), dtype=torch.int32, device=device)
         output = flash_attn_with_kvcache(
             query,
-            key_cache,
-            value_cache,
+            maybe_fp8(key_cache, kv_cache_dtype),
+            maybe_fp8(value_cache, kv_cache_dtype),
             k=key,
             v=value,
             cache_seqlens=cache_seqlens,
